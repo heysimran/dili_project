@@ -7,6 +7,7 @@
 #include "randombytes.h"
 #include "symmetric.h"
 #include "fips202.h"
+#include "gpu_verify.h"
 
 /*************************************************
 * Name:        crypto_sign_keypair
@@ -327,17 +328,20 @@ int crypto_sign_verify_internal(const uint8_t *sig,
   poly_challenge(&cp, c);
   polyvec_matrix_expand(mat, rho);
 
-  polyvecl_ntt(&z);
-  polyvec_matrix_pointwise_montgomery(&w1, mat, &z);
+  if (gpu_compute_wprime(&w1, mat, &z, &cp, &t1) != 0) {
+    /* Fallback: CPU path (NTT -> pointwise -> invNTT) */
+    polyvecl_ntt(&z);
+    polyvec_matrix_pointwise_montgomery(&w1, mat, &z);
 
-  poly_ntt(&cp);
-  polyveck_shiftl(&t1);
-  polyveck_ntt(&t1);
-  polyveck_pointwise_poly_montgomery(&t1, &cp, &t1);
+    poly_ntt(&cp);
+    polyveck_shiftl(&t1);
+    polyveck_ntt(&t1);
+    polyveck_pointwise_poly_montgomery(&t1, &cp, &t1);
 
-  polyveck_sub(&w1, &w1, &t1);
-  polyveck_reduce(&w1);
-  polyveck_invntt_tomont(&w1);
+    polyveck_sub(&w1, &w1, &t1);
+    polyveck_reduce(&w1);
+    polyveck_invntt_tomont(&w1);
+  }
 
   /* Reconstruct w1 */
   polyveck_caddq(&w1);

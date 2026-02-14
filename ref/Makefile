@@ -4,7 +4,7 @@ CFLAGS += -Wall -Wextra -Wpedantic -Wmissing-prototypes -Wredundant-decls \
 NISTFLAGS += -Wno-unused-result -O3 -fomit-frame-pointer
 SOURCES = sign.c packing.c polyvec.c poly.c ntt.c reduce.c rounding.c
 HEADERS = config.h params.h api.h sign.h packing.h polyvec.h poly.h ntt.h \
-  reduce.h rounding.h symmetric.h randombytes.h
+  reduce.h rounding.h symmetric.h randombytes.h gpu_verify.h
 KECCAK_SOURCES = $(SOURCES) fips202.c symmetric-shake.c
 KECCAK_HEADERS = $(HEADERS) fips202.h
 
@@ -80,11 +80,19 @@ test/test_vectors5: test/test_vectors.c $(KECCAK_SOURCES) \
 	  -o $@ $< $(KECCAK_SOURCES)
 
 test/test_speed2: test/test_speed.c test/speed_print.c test/speed_print.h \
-  test/cpucycles.c test/cpucycles.h randombytes.c $(KECCAK_SOURCES) \
-  $(KECCAK_HEADERS)
+  test/cpucycles.c test/cpucycles.h randombytes.c gpu_verify_stub.c \
+  $(KECCAK_SOURCES) $(KECCAK_HEADERS)
 	$(CC) $(CFLAGS) -DDILITHIUM_MODE=2 \
 	  -o $@ $< test/speed_print.c test/cpucycles.c randombytes.c \
-	  $(KECCAK_SOURCES)
+	  gpu_verify_stub.c $(KECCAK_SOURCES)
+
+# CUDA-accelerated verification (optional; requires nvcc and CUDA runtime)
+NVCC ?= nvcc
+test/test_speed2_cuda: test/test_speed.c test/speed_print.c test/speed_print.h \
+  test/cpucycles.c test/cpucycles.h randombytes.c gpu_verify.cu \
+  $(KECCAK_SOURCES) $(KECCAK_HEADERS)
+	$(NVCC) -DDILITHIUM_MODE=2 -I. -O3 -o $@ test/test_speed.c test/speed_print.c \
+	  test/cpucycles.c randombytes.c gpu_verify.cu $(KECCAK_SOURCES) -lcudart
 
 test/test_speed3: test/test_speed.c test/speed_print.c test/speed_print.h \
   test/cpucycles.c test/cpucycles.h randombytes.c $(KECCAK_SOURCES) \
@@ -120,6 +128,7 @@ nistkat/PQCgenKAT_sign5: nistkat/PQCgenKAT_sign.c nistkat/rng.c nistkat/rng.h $(
 
 clean:
 	rm -f *~ test/*~ *.gcno *.gcda *.lcov
+	rm -f test/test_speed2_cuda
 	rm -f libpqcrystals_dilithium2_ref.so
 	rm -f libpqcrystals_dilithium3_ref.so
 	rm -f libpqcrystals_dilithium5_ref.so
