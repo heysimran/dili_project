@@ -253,8 +253,8 @@ int gpu_compute_wprime(polyveck *w1, const polyvecl mat[K], const polyvecl *z,
     off++;
   }
 
-  cudaEvent_t evt_start, evt_stop;
 #ifdef GPU_VERIFY_BENCHMARK
+  cudaEvent_t evt_start, evt_stop;
   cudaEventCreate(&evt_start);
   cudaEventCreate(&evt_stop);
   cudaEventRecord(evt_start, st);

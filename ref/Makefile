@@ -12,7 +12,10 @@ GPU_STUB = gpu_verify_stub.c
 
 # CUDA (optional): nvcc for .cu; never use CC on .cu files
 NVCC ?= nvcc
-NVCCFLAGS = -O3 -I. -arch=sm_50
+CUDA_PATH ?= /usr/local/cuda
+NVCCFLAGS = -O3 -I. -arch=sm_50 -Wno-deprecated-gpu-targets
+# Linker needs -L for libcudart (Colab/Linux)
+CUDA_LDFLAGS = -L$(CUDA_PATH)/lib64 -lcudart -lstdc++
 
 .PHONY: all speed speed_cuda shared clean
 
@@ -108,13 +111,13 @@ test/test_speed2_cuda: test/test_speed.c test/speed_print.c test/speed_print.h \
   test/cpucycles.c test/cpucycles.h randombytes.c gpu_verify.cu gpu_verify_cuda.o \
   $(KECCAK_SOURCES) $(KECCAK_HEADERS)
 	$(CC) $(CFLAGS) -DDILITHIUM_MODE=2 -o $@ test/test_speed.c test/speed_print.c \
-	  test/cpucycles.c randombytes.c $(KECCAK_SOURCES) gpu_verify_cuda.o -lcudart -lstdc++
+	  test/cpucycles.c randombytes.c $(KECCAK_SOURCES) gpu_verify_cuda.o $(CUDA_LDFLAGS)
 
 test/test_speed2_cuda_bench: test/test_speed.c test/speed_print.c test/speed_print.h \
   test/cpucycles.c test/cpucycles.h randombytes.c gpu_verify.cu gpu_verify_cuda_bench.o \
   $(KECCAK_SOURCES) $(KECCAK_HEADERS)
 	$(CC) $(CFLAGS) -DDILITHIUM_MODE=2 -o $@ test/test_speed.c test/speed_print.c \
-	  test/cpucycles.c randombytes.c $(KECCAK_SOURCES) gpu_verify_cuda_bench.o -lcudart -lstdc++
+	  test/cpucycles.c randombytes.c $(KECCAK_SOURCES) gpu_verify_cuda_bench.o $(CUDA_LDFLAGS)
 
 test/test_speed3: test/test_speed.c test/speed_print.c test/speed_print.h \
   test/cpucycles.c test/cpucycles.h randombytes.c $(GPU_STUB) $(KECCAK_SOURCES) \
