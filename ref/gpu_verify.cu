@@ -194,6 +194,16 @@ static void device_to_host_w1(int32_t *d_w1, polyveck *w1, cudaStream_t st) {
     cudaMemcpyAsync(w1->vec[i].coeffs, d_w1 + i * N, N * sizeof(int32_t), cudaMemcpyDeviceToHost, st);
 }
 
+#ifdef GPU_VERIFY_BENCHMARK
+static double gpu_benchmark_total_ms = 0;
+static int gpu_benchmark_n_calls = 0;
+static void gpu_benchmark_atexit(void) {
+  fprintf(stderr, "[GPU_VERIFY_BENCHMARK] NTT+pointwise+invNTT kernel only: total %.3f ms over %d calls, avg %.6f ms/call\n",
+          gpu_benchmark_total_ms, gpu_benchmark_n_calls,
+          gpu_benchmark_n_calls ? gpu_benchmark_total_ms / gpu_benchmark_n_calls : 0);
+}
+#endif
+
 extern "C" {
 
 int gpu_compute_wprime(polyveck *w1, const polyvecl mat[K], const polyvecl *z,
@@ -205,6 +215,14 @@ int gpu_compute_wprime(polyveck *w1, const polyvecl mat[K], const polyvecl *z,
   int32_t *d_mat = NULL, *d_z = NULL, *d_cp = NULL, *d_t1 = NULL, *d_w1 = NULL;
   cudaStream_t st;
   cudaStreamCreate(&st);
+
+#ifdef GPU_VERIFY_BENCHMARK
+  static int atexit_registered = 0;
+  if (!atexit_registered) {
+    atexit_registered = 1;
+    atexit(gpu_benchmark_atexit);
+  }
+#endif
 
   CUDA_CHECK(cudaMemcpyToSymbol(d_zetas, h_zetas, N * sizeof(int32_t)));
 
@@ -235,6 +253,13 @@ int gpu_compute_wprime(polyveck *w1, const polyvecl mat[K], const polyvecl *z,
     off++;
   }
 
+  cudaEvent_t evt_start, evt_stop;
+#ifdef GPU_VERIFY_BENCHMARK
+  cudaEventCreate(&evt_start);
+  cudaEventCreate(&evt_stop);
+  cudaEventRecord(evt_start, st);
+#endif
+
   kernel_ntt<<<n_ntt, 128, 0, st>>>(d_all_ntt, n_ntt);
   CUDA_CHECK(cudaGetLastError());
 
@@ -258,6 +283,17 @@ int gpu_compute_wprime(polyveck *w1, const polyvecl mat[K], const polyvecl *z,
 
   kernel_invntt<<<K, 128, 0, st>>>(d_w1, K);
   CUDA_CHECK(cudaGetLastError());
+
+#ifdef GPU_VERIFY_BENCHMARK
+  cudaEventRecord(evt_stop, st);
+  cudaEventSynchronize(evt_stop);
+  float kernel_ms = 0.0f;
+  cudaEventElapsedTime(&kernel_ms, evt_start, evt_stop);
+  cudaEventDestroy(evt_start);
+  cudaEventDestroy(evt_stop);
+  gpu_benchmark_total_ms += (double)kernel_ms;
+  gpu_benchmark_n_calls++;
+#endif
 
   device_to_host_w1(d_w1, w1, st);
   CUDA_CHECK(cudaStreamSynchronize(st));

@@ -100,11 +100,21 @@ test/test_speed2: test/test_speed.c test/speed_print.c test/speed_print.h \
 gpu_verify_cuda.o: gpu_verify.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) -DDILITHIUM_MODE=2 -c -o $@ $<
 
+# Same but with GPU_VERIFY_BENCHMARK: prints kernel-only time (NTT+pointwise+invNTT) at exit
+gpu_verify_cuda_bench.o: gpu_verify.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) -DDILITHIUM_MODE=2 -DGPU_VERIFY_BENCHMARK -c -o $@ $<
+
 test/test_speed2_cuda: test/test_speed.c test/speed_print.c test/speed_print.h \
   test/cpucycles.c test/cpucycles.h randombytes.c gpu_verify.cu gpu_verify_cuda.o \
   $(KECCAK_SOURCES) $(KECCAK_HEADERS)
 	$(CC) $(CFLAGS) -DDILITHIUM_MODE=2 -o $@ test/test_speed.c test/speed_print.c \
 	  test/cpucycles.c randombytes.c $(KECCAK_SOURCES) gpu_verify_cuda.o -lcudart -lstdc++
+
+test/test_speed2_cuda_bench: test/test_speed.c test/speed_print.c test/speed_print.h \
+  test/cpucycles.c test/cpucycles.h randombytes.c gpu_verify.cu gpu_verify_cuda_bench.o \
+  $(KECCAK_SOURCES) $(KECCAK_HEADERS)
+	$(CC) $(CFLAGS) -DDILITHIUM_MODE=2 -o $@ test/test_speed.c test/speed_print.c \
+	  test/cpucycles.c randombytes.c $(KECCAK_SOURCES) gpu_verify_cuda_bench.o -lcudart -lstdc++
 
 test/test_speed3: test/test_speed.c test/speed_print.c test/speed_print.h \
   test/cpucycles.c test/cpucycles.h randombytes.c $(GPU_STUB) $(KECCAK_SOURCES) \
@@ -140,7 +150,7 @@ nistkat/PQCgenKAT_sign5: nistkat/PQCgenKAT_sign.c nistkat/rng.c nistkat/rng.h $(
 
 clean:
 	rm -f *~ test/*~ *.gcno *.gcda *.lcov
-	rm -f gpu_verify_cuda.o test/test_speed2_cuda
+	rm -f gpu_verify_cuda.o gpu_verify_cuda_bench.o test/test_speed2_cuda test/test_speed2_cuda_bench
 	rm -f libpqcrystals_dilithium2_ref.so
 	rm -f libpqcrystals_dilithium3_ref.so
 	rm -f libpqcrystals_dilithium5_ref.so
