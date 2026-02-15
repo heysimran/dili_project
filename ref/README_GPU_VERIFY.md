@@ -28,9 +28,12 @@ make speed
 
 ```bash
 cd ref
-make test/test_speed2_cuda
+make speed_cuda
+# or: make test/test_speed2_cuda
 ./test/test_speed2_cuda
 ```
+
+The CUDA build compiles `gpu_verify.cu` with `nvcc` only (never `cc`), then links with the C objects and `-lcudart`.
 
 Requires `nvcc` and CUDA runtime (e.g. CUDA Toolkit). If the GPU path is unavailable, the code falls back to CPU verification automatically.
 
@@ -90,7 +93,7 @@ If `nvcc` is not found, install the CUDA toolkit in the notebook (example for Ub
 
 ```bash
 %cd dilithium/ref
-!make test/test_speed2_cuda
+!make speed_cuda
 !./test/test_speed2_cuda
 ```
 
@@ -119,7 +122,7 @@ if not os.path.isdir("dilithium"):
 os.chdir("dilithium/ref")
 
 # Cell 2: build CUDA speed test
-os.system("make test/test_speed2_cuda")
+os.system("make speed_cuda")
 
 # Cell 3: run (uses GPU if available)
 os.system("./test/test_speed2_cuda")
@@ -137,5 +140,5 @@ The upstream [pq-crystals/dilithium](https://github.com/pq-crystals/dilithium) d
 ## Summary
 
 - **CPU build:** `make speed` → `./test/test_speed2` (uses stub; verification is CPU-only).
-- **GPU build:** `make test/test_speed2_cuda` → `./test/test_speed2_cuda` (verification uses GPU when available).
+- **GPU build:** `make speed_cuda` or `make test/test_speed2_cuda` → `./test/test_speed2_cuda` (verification uses GPU when available). The `.cu` file is compiled only by `nvcc`, never by `cc`.
 - **Colab:** Enable GPU (Runtime → Change runtime type → GPU), clone the repo (or your fork with the GPU code), `cd ref`, then run the same make and run commands as above.
