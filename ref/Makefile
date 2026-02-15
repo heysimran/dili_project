@@ -17,7 +17,12 @@ NVCCFLAGS = -O3 -I. -arch=sm_50 -Wno-deprecated-gpu-targets
 # Linker needs -L for libcudart (Colab/Linux)
 CUDA_LDFLAGS = -L$(CUDA_PATH)/lib64 -lcudart -lstdc++
 
-.PHONY: all speed speed_cuda shared clean
+.PHONY: all speed speed_cuda shared clean benchmark
+
+# Build both CPU and GPU benchmark binaries for kernel-only comparison
+benchmark: test/test_speed2_cpu_bench test/test_speed2_cuda_bench
+	@echo "Run: ./test/test_speed2_cpu_bench   (CPU kernel-only timing)"
+	@echo "Run: ./test/test_speed2_cuda_bench  (GPU kernel-only timing)"
 
 all: \
   test/test_dilithium2 \
@@ -97,6 +102,14 @@ test/test_speed2: test/test_speed.c test/speed_print.c test/speed_print.h \
 	  -o $@ $< test/speed_print.c test/cpucycles.c randombytes.c \
 	  gpu_verify_stub.c $(KECCAK_SOURCES)
 
+# CPU benchmark: prints NTT+pointwise+invNTT kernel-only time at exit
+test/test_speed2_cpu_bench: test/test_speed.c test/speed_print.c test/speed_print.h \
+  test/cpucycles.c test/cpucycles.h randombytes.c gpu_verify_stub.c \
+  $(KECCAK_SOURCES) $(KECCAK_HEADERS)
+	$(CC) $(CFLAGS) -DDILITHIUM_MODE=2 -DCPU_VERIFY_BENCHMARK \
+	  -o $@ $< test/speed_print.c test/cpucycles.c randombytes.c \
+	  gpu_verify_stub.c $(KECCAK_SOURCES)
+
 # CUDA-accelerated verification: .cu compiled ONLY by nvcc, never by cc
 # 1) Compile gpu_verify.cu -> gpu_verify_cuda.o with nvcc
 # 2) Compile C sources with gcc, link with gpu_verify_cuda.o and -lcudart
@@ -164,7 +177,7 @@ clean:
 	rm -f test/test_vectors2
 	rm -f test/test_vectors3
 	rm -f test/test_vectors5
-	rm -f test/test_speed2
+	rm -f test/test_speed2 test/test_speed2_cpu_bench
 	rm -f test/test_speed3
 	rm -f test/test_speed5
 	rm -f test/test_mul

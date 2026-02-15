@@ -141,4 +141,5 @@ The upstream [pq-crystals/dilithium](https://github.com/pq-crystals/dilithium) d
 
 - **CPU build:** `make speed` → `./test/test_speed2` (uses stub; verification is CPU-only).
 - **GPU build:** `make speed_cuda` or `make test/test_speed2_cuda` → `./test/test_speed2_cuda` (verification uses GPU when available). The `.cu` file is compiled only by `nvcc`, never by `cc`.
+- **Kernel-only benchmark (CPU vs GPU):** `make benchmark` → run `./test/test_speed2_cpu_bench` and `./test/test_speed2_cuda_bench`. Each prints `[CPU_VERIFY_BENCHMARK]` or `[GPU_VERIFY_BENCHMARK]` with NTT+pointwise+invNTT time; compare avg ms/call for acceleration.
 - **Colab:** Enable GPU (Runtime → Change runtime type → GPU), clone the repo (or your fork with the GPU code), `cd ref`, then run the same make and run commands as above.

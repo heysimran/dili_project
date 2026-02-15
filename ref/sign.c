@@ -1,4 +1,7 @@
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 #include "params.h"
 #include "sign.h"
 #include "packing.h"
@@ -8,6 +11,16 @@
 #include "symmetric.h"
 #include "fips202.h"
 #include "gpu_verify.h"
+
+#ifdef CPU_VERIFY_BENCHMARK
+static double cpu_bench_total_ns = 0;
+static int cpu_bench_n_calls = 0;
+static void cpu_benchmark_atexit(void) {
+  fprintf(stderr, "[CPU_VERIFY_BENCHMARK] NTT+pointwise+invNTT: total %.3f ms over %d calls, avg %.6f ms/call\n",
+          cpu_bench_total_ns / 1e6, cpu_bench_n_calls,
+          cpu_bench_n_calls ? (cpu_bench_total_ns / 1e6) / cpu_bench_n_calls : 0);
+}
+#endif
 
 /*************************************************
 * Name:        crypto_sign_keypair
@@ -330,6 +343,15 @@ int crypto_sign_verify_internal(const uint8_t *sig,
 
   if (gpu_compute_wprime(&w1, mat, &z, &cp, &t1) != 0) {
     /* Fallback: CPU path (NTT -> pointwise -> invNTT) */
+#ifdef CPU_VERIFY_BENCHMARK
+    struct timespec t0, t1_ts;
+    static int atexit_reg = 0;
+    if (!atexit_reg) {
+      atexit_reg = 1;
+      atexit(cpu_benchmark_atexit);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+#endif
     polyvecl_ntt(&z);
     polyvec_matrix_pointwise_montgomery(&w1, mat, &z);
 
@@ -341,6 +363,11 @@ int crypto_sign_verify_internal(const uint8_t *sig,
     polyveck_sub(&w1, &w1, &t1);
     polyveck_reduce(&w1);
     polyveck_invntt_tomont(&w1);
+#ifdef CPU_VERIFY_BENCHMARK
+    clock_gettime(CLOCK_MONOTONIC, &t1_ts);
+    cpu_bench_total_ns += (t1_ts.tv_sec - t0.tv_sec) * 1e9 + (t1_ts.tv_nsec - t0.tv_nsec);
+    cpu_bench_n_calls++;
+#endif
   }
 
   /* Reconstruct w1 */
