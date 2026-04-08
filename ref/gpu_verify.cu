@@ -1,7 +1,13 @@
 /**
  * GPU-accelerated verification bottleneck: w' = A·z − c·t
  * NTT -> pointwise multiplication -> inverse NTT on device.
- * Dilithium2 (K=4, L=4, N=256) only. Build with -DDILITHIUM_MODE=2.
+ * Supports Dilithium 2, 3, 5 via DILITHIUM_MODE.
+ *
+ * KEY FIXES over previous version:
+ *   - cudaMalloc/Free and stream are persistent (init once, not per call)
+ *   - cudaMemcpyToSymbol(zetas) done once at init
+ *   - Contiguous device buffers, fewer memcpy calls
+ *   - Proper warmup support
  */
 
 #include "gpu_verify.h"
@@ -12,15 +18,30 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 
+/* ------------------------------------------------------------------ */
+/* Error checking macro                                                 */
+/* ------------------------------------------------------------------ */
 #define CUDA_CHECK(call) do { \
   cudaError_t e = (call); \
   if (e != cudaSuccess) { \
-    fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); \
+    fprintf(stderr, "CUDA error %s at %s:%d\n", \
+            cudaGetErrorString(e), __FILE__, __LINE__); \
     return -1; \
   } \
 } while(0)
 
-/* Zetas table from ref/ntt.c (must match exactly) */
+#define CUDA_CHECK_VOID(call) do { \
+  cudaError_t e = (call); \
+  if (e != cudaSuccess) { \
+    fprintf(stderr, "CUDA error %s at %s:%d\n", \
+            cudaGetErrorString(e), __FILE__, __LINE__); \
+    return; \
+  } \
+} while(0)
+
+/* ------------------------------------------------------------------ */
+/* Zetas (same as ref/ntt.c, must match exactly)                       */
+/* ------------------------------------------------------------------ */
 static const int32_t h_zetas[256] = {
          0,    25847, -2608894,  -518909,   237124,  -777960,  -876248,   466468,
    1826347,  2353451,  -359251, -2091905,  3119733, -2884855,  3111497,  2680103,
@@ -56,22 +77,58 @@ static const int32_t h_zetas[256] = {
    -554416,  3919660,   -48306, -1362209,  3937738,  1400424,  -846154,  1976782
 };
 
-__constant__ int32_t d_zetas[N];
+__constant__ int32_t d_zetas[256];
 
-/* Device: Montgomery reduce */
+/* ------------------------------------------------------------------ */
+/* Persistent GPU state (allocated once, reused across calls)          */
+/* ------------------------------------------------------------------ */
+static int32_t *d_mat  = NULL;   /* K*L*N int32 */
+static int32_t *d_z    = NULL;   /* L*N   int32 */
+static int32_t *d_cp   = NULL;   /* N     int32 */
+static int32_t *d_t1   = NULL;   /* K*N   int32 */
+static int32_t *d_w1   = NULL;   /* K*N   int32 */
+static int32_t *d_ntt  = NULL;   /* (L+1+K)*N int32  -- scratch for batched NTT */
+static cudaStream_t g_stream     = NULL;
+static int g_initialized         = 0;
+
+/* ------------------------------------------------------------------ */
+/* Benchmark accumulators                                               */
+/* ------------------------------------------------------------------ */
+#ifdef GPU_VERIFY_BENCHMARK
+static double gpu_kernel_total_ms  = 0.0;
+static double gpu_e2e_total_ms     = 0.0;
+static int    gpu_n_calls          = 0;
+
+static void gpu_benchmark_atexit(void) {
+  if (gpu_n_calls == 0) return;
+  fprintf(stderr,
+    "\n[GPU_VERIFY_BENCHMARK] Over %d calls:\n"
+    "  Kernel only (NTT+pw+iNTT):  total %.3f ms,  avg %.6f ms/call\n"
+    "  End-to-end (incl. memcpy):  total %.3f ms,  avg %.6f ms/call\n",
+    gpu_n_calls,
+    gpu_kernel_total_ms, gpu_kernel_total_ms / gpu_n_calls,
+    gpu_e2e_total_ms,    gpu_e2e_total_ms    / gpu_n_calls);
+}
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Device helpers                                                       */
+/* ------------------------------------------------------------------ */
 __device__ __forceinline__ int32_t montgomery_reduce(int64_t a) {
-  int32_t t = (int64_t)(int32_t)a * QINV;
-  t = (int32_t)((a - (int64_t)t * Q) >> 32);
-  return t;
+  int32_t t = (int32_t)((int64_t)(int32_t)a * (int64_t)QINV);
+  return (int32_t)((a - (int64_t)t * Q) >> 32);
 }
 
-/* Device: reduce32 */
 __device__ __forceinline__ int32_t reduce32_dev(int32_t a) {
   int32_t t = (a + (1 << 22)) >> 23;
   return a - t * Q;
 }
 
-/* One block per polynomial (128 threads). In-place NTT matching ref loop order. */
+/* ------------------------------------------------------------------ */
+/* Kernels                                                              */
+/* ------------------------------------------------------------------ */
+
+/* NTT: one block per polynomial, 128 threads. */
 __global__ void kernel_ntt(int32_t *polys, int npolys) {
   int poly_idx = blockIdx.x;
   if (poly_idx >= npolys) return;
@@ -79,29 +136,28 @@ __global__ void kernel_ntt(int32_t *polys, int npolys) {
 
   __shared__ int32_t sh[N];
   int tid = threadIdx.x;
-  if (tid < 128) sh[tid] = a[tid];
-  if (tid + 128 < N) sh[tid + 128] = a[tid + 128];
+  sh[tid]       = a[tid];
+  sh[tid + 128] = a[tid + 128];
   __syncthreads();
 
   for (int len = 128; len > 0; len >>= 1) {
-    /* ref: k starts 0, ++k per start; len=128 uses zetas[1], len=64 uses 2,3, etc. */
     int k_start = (len == 128) ? 1 : (256 / len);
-    for (int b = tid; b < 128; b += blockDim.x) {
+    for (int b = tid; b < 128; b += 128) {
       int start_index = b / len;
       int j = start_index * (2 * len) + (b % len);
       int32_t zeta = d_zetas[k_start + start_index];
-      int32_t t = montgomery_reduce((int64_t)zeta * (int64_t)sh[j + len]);
+      int32_t t = montgomery_reduce((int64_t)zeta * sh[j + len]);
       sh[j + len] = sh[j] - t;
-      sh[j] = sh[j] + t;
+      sh[j]       = sh[j] + t;
     }
     __syncthreads();
   }
 
-  if (tid < 128) a[tid] = sh[tid];
-  if (tid + 128 < N) a[tid + 128] = sh[tid + 128];
+  a[tid]       = sh[tid];
+  a[tid + 128] = sh[tid + 128];
 }
 
-/* One block per polynomial. In-place invNTT matching ref. */
+/* Inverse NTT: one block per polynomial, 128 threads. */
 __global__ void kernel_invntt(int32_t *polys, int npolys) {
   const int32_t f = 41978;
   int poly_idx = blockIdx.x;
@@ -110,203 +166,250 @@ __global__ void kernel_invntt(int32_t *polys, int npolys) {
 
   __shared__ int32_t sh[N];
   int tid = threadIdx.x;
-  if (tid < 128) sh[tid] = a[tid];
-  if (tid + 128 < N) sh[tid + 128] = a[tid + 128];
+  sh[tid]       = a[tid];
+  sh[tid + 128] = a[tid + 128];
   __syncthreads();
 
   for (int len = 1; len < N; len <<= 1) {
-    /* ref invntt: k starts 256, then --k per start; for this len, k = 256/len - 1 - start_index */
-    for (int b = tid; b < 128; b += blockDim.x) {
+    for (int b = tid; b < 128; b += 128) {
       int start_index = b / len;
       int j = start_index * (2 * len) + (b % len);
       int k = (256 / len) - 1 - start_index;
       int32_t zeta = -d_zetas[k];
-      int32_t t = sh[j];
-      sh[j] = t + sh[j + len];
-      sh[j + len] = montgomery_reduce((int64_t)zeta * (int64_t)(t - sh[j + len]));
+      int32_t t    = sh[j];
+      sh[j]        = t + sh[j + len];
+      sh[j + len]  = montgomery_reduce((int64_t)zeta * (t - sh[j + len]));
     }
     __syncthreads();
   }
 
-  if (tid < N)
-    sh[tid] = montgomery_reduce((int64_t)f * (int64_t)sh[tid]);
+  sh[tid]       = montgomery_reduce((int64_t)f * sh[tid]);
+  sh[tid + 128] = montgomery_reduce((int64_t)f * sh[tid + 128]);
   __syncthreads();
-  if (tid < 128) a[tid] = sh[tid];
-  if (tid + 128 < N) a[tid + 128] = sh[tid + 128];
+  a[tid]       = sh[tid];
+  a[tid + 128] = sh[tid + 128];
 }
 
-/* shiftl: a[i] <<= D. One block per polynomial, N threads. */
+/* shiftl: t1[i] <<= D. One block per poly, N threads. */
 __global__ void kernel_shiftl(int32_t *polys, int npolys) {
   int poly_idx = blockIdx.x;
   if (poly_idx >= npolys) return;
-  int32_t *a = polys + poly_idx * N;
   int i = threadIdx.x;
-  if (i < N) a[i] <<= D;
+  if (i < N) polys[poly_idx * N + i] <<= D;
 }
 
-/* Kernel: compute w1 = A*z - c*t1 in NTT domain.
- * Layout: d_mat [K][L][N], d_z [L][N], d_cp [N], d_t1 [K][N], d_w1 [K][N].
- * Each block handles one row i: w1[i] = sum_j pointwise(mat[i][j], z[j]) - pointwise(cp, t1[i]).
+/*
+ * w1 = A*z - c*t1 in NTT domain.
+ * Each block handles one row i of A (0..K-1).
+ * N threads per block, each handles one coefficient k.
  */
 __global__ void kernel_w1_from_az_ct(const int32_t *d_mat, const int32_t *d_z,
-                                     const int32_t *d_cp, const int32_t *d_t1,
+                                     const int32_t *d_cp,  const int32_t *d_t1,
                                      int32_t *d_w1) {
   int i = blockIdx.x;
   int k = threadIdx.x;
   if (i >= K || k >= N) return;
 
   int64_t sum = 0;
-  for (int j = 0; j < L; j++) {
-    int mat_idx = ((i * L) + j) * N + k;
-    int z_idx = j * N + k;
-    sum += (int64_t)d_mat[mat_idx] * (int64_t)d_z[z_idx];
-  }
+  for (int j = 0; j < L; j++)
+    sum += (int64_t)d_mat[(i * L + j) * N + k] * (int64_t)d_z[j * N + k];
+
   int32_t az_k = montgomery_reduce(sum);
   int32_t ct_k = montgomery_reduce((int64_t)d_cp[k] * (int64_t)d_t1[i * N + k]);
   d_w1[i * N + k] = az_k - ct_k;
 }
 
-/* Reduce32 on w1 (K polynomials). One block per polynomial, N threads. */
+/* Reduce w1 coefficients. K blocks, N threads. */
 __global__ void kernel_reduce(int32_t *d_w1) {
   int poly_idx = blockIdx.x;
-  int i = threadIdx.x;
+  int i        = threadIdx.x;
   if (poly_idx < K && i < N)
     d_w1[poly_idx * N + i] = reduce32_dev(d_w1[poly_idx * N + i]);
 }
 
-/* Flattened layout helpers: mat is row-major K*L*N, z is L*N, t1/w1 are K*N. */
-static void host_to_device_verify(const polyvecl mat[K], const polyvecl *z,
-                                  const poly *cp, const polyveck *t1,
-                                  int32_t *d_mat, int32_t *d_z, int32_t *d_cp,
-                                  int32_t *d_t1, cudaStream_t st) {
-  for (int i = 0; i < K; i++)
-    for (int j = 0; j < L; j++)
-      cudaMemcpyAsync(d_mat + (i * L + j) * N, mat[i].vec[j].coeffs, N * sizeof(int32_t), cudaMemcpyHostToDevice, st);
-  for (int j = 0; j < L; j++)
-    cudaMemcpyAsync(d_z + j * N, z->vec[j].coeffs, N * sizeof(int32_t), cudaMemcpyHostToDevice, st);
-  cudaMemcpyAsync(d_cp, cp->coeffs, N * sizeof(int32_t), cudaMemcpyHostToDevice, st);
-  for (int i = 0; i < K; i++)
-    cudaMemcpyAsync(d_t1 + i * N, t1->vec[i].coeffs, N * sizeof(int32_t), cudaMemcpyHostToDevice, st);
-}
+/* ------------------------------------------------------------------ */
+/* One-time GPU initialisation                                          */
+/* ------------------------------------------------------------------ */
+static int gpu_init(void) {
+  if (g_initialized) return 0;
 
-static void device_to_host_w1(int32_t *d_w1, polyveck *w1, cudaStream_t st) {
-  for (int i = 0; i < K; i++)
-    cudaMemcpyAsync(w1->vec[i].coeffs, d_w1 + i * N, N * sizeof(int32_t), cudaMemcpyDeviceToHost, st);
-}
+  /* Upload zetas once */
+  if (cudaMemcpyToSymbol(d_zetas, h_zetas, 256 * sizeof(int32_t))
+      != cudaSuccess) return -1;
+
+  /* Allocate all device buffers once */
+  if (cudaMalloc(&d_mat, K * L * N * sizeof(int32_t)) != cudaSuccess) return -1;
+  if (cudaMalloc(&d_z,   L     * N * sizeof(int32_t)) != cudaSuccess) return -1;
+  if (cudaMalloc(&d_cp,          N * sizeof(int32_t)) != cudaSuccess) return -1;
+  if (cudaMalloc(&d_t1,  K     * N * sizeof(int32_t)) != cudaSuccess) return -1;
+  if (cudaMalloc(&d_w1,  K     * N * sizeof(int32_t)) != cudaSuccess) return -1;
+  int n_ntt = L + 1 + K;
+  if (cudaMalloc(&d_ntt, n_ntt * N * sizeof(int32_t)) != cudaSuccess) return -1;
+
+  if (cudaStreamCreate(&g_stream) != cudaSuccess) return -1;
 
 #ifdef GPU_VERIFY_BENCHMARK
-static double gpu_benchmark_total_ms = 0;
-static int gpu_benchmark_n_calls = 0;
-static void gpu_benchmark_atexit(void) {
-  fprintf(stderr, "[GPU_VERIFY_BENCHMARK] NTT+pointwise+invNTT kernel only: total %.3f ms over %d calls, avg %.6f ms/call\n",
-          gpu_benchmark_total_ms, gpu_benchmark_n_calls,
-          gpu_benchmark_n_calls ? gpu_benchmark_total_ms / gpu_benchmark_n_calls : 0);
-}
+  static int atexit_done = 0;
+  if (!atexit_done) { atexit_done = 1; atexit(gpu_benchmark_atexit); }
 #endif
 
+  g_initialized = 1;
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Public API                                                           */
+/* ------------------------------------------------------------------ */
 extern "C" {
 
+/*
+ * gpu_compute_wprime()
+ * Computes w1 = A*z - c*t1 on the GPU (NTT domain).
+ * Call gpu_warmup() before benchmarking to eliminate first-call overhead.
+ */
 int gpu_compute_wprime(polyveck *w1, const polyvecl mat[K], const polyvecl *z,
-                      const poly *cp, const polyveck *t1) {
-#if DILITHIUM_MODE != 2
-  (void)w1; (void)mat; (void)z; (void)cp; (void)t1;
-  return -1; /* only Dilithium2 supported */
-#else
-  int32_t *d_mat = NULL, *d_z = NULL, *d_cp = NULL, *d_t1 = NULL, *d_w1 = NULL;
-  cudaStream_t st;
-  cudaStreamCreate(&st);
+                       const poly *cp, const polyveck *t1) {
+  if (gpu_init() != 0) return -1;
 
+  const int n_ntt = L + 1 + K;
+
+  /* ---- E2E timer start ------------------------------------------- */
 #ifdef GPU_VERIFY_BENCHMARK
-  static int atexit_registered = 0;
-  if (!atexit_registered) {
-    atexit_registered = 1;
-    atexit(gpu_benchmark_atexit);
-  }
+  cudaEvent_t e2e_start, e2e_stop, kern_start, kern_stop;
+  cudaEventCreate(&e2e_start);  cudaEventCreate(&e2e_stop);
+  cudaEventCreate(&kern_start); cudaEventCreate(&kern_stop);
+  cudaEventRecord(e2e_start, g_stream);
 #endif
 
-  CUDA_CHECK(cudaMemcpyToSymbol(d_zetas, h_zetas, N * sizeof(int32_t)));
+  /* ---- Upload inputs (contiguous copies where possible) ----------- */
+  /* mat: K*L polynomials laid out as [K][L][N] */
+  cudaMemcpyAsync(d_mat, mat[0].vec[0].coeffs,
+                  K * L * N * sizeof(int32_t),
+                  cudaMemcpyHostToDevice, g_stream);
 
-  CUDA_CHECK(cudaMalloc(&d_mat, K * L * N * sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_z, L * N * sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_cp, N * sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_t1, K * N * sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_w1, K * N * sizeof(int32_t)));
+  /* z: L polynomials [L][N] */
+  cudaMemcpyAsync(d_z, z->vec[0].coeffs,
+                  L * N * sizeof(int32_t),
+                  cudaMemcpyHostToDevice, g_stream);
 
-  host_to_device_verify(mat, z, cp, t1, d_mat, d_z, d_cp, d_t1, st);
+  /* cp: single polynomial [N] */
+  cudaMemcpyAsync(d_cp, cp->coeffs,
+                  N * sizeof(int32_t),
+                  cudaMemcpyHostToDevice, g_stream);
 
-  /* Ref uses mat in standard form; NTT only z, cp, and t1 (after shiftl). */
-  kernel_shiftl<<<K, N, 0, st>>>(d_t1, K);
+  /* t1: K polynomials [K][N] */
+  cudaMemcpyAsync(d_t1, t1->vec[0].coeffs,
+                  K * N * sizeof(int32_t),
+                  cudaMemcpyHostToDevice, g_stream);
 
-  int n_ntt = L + 1 + K;  /* z (L), cp (1), t1 (K) */
-  int32_t *d_all_ntt = NULL;
-  CUDA_CHECK(cudaMalloc(&d_all_ntt, n_ntt * N * sizeof(int32_t)));
+  /* ---- Preprocessing --------------------------------------------- */
+  kernel_shiftl<<<K, N, 0, g_stream>>>(d_t1, K);
 
-  size_t off = 0;
-  for (int j = 0; j < L; j++) {
-    cudaMemcpyAsync(d_all_ntt + off * N, d_z + j * N, N * sizeof(int32_t), cudaMemcpyDeviceToDevice, st);
-    off++;
-  }
-  cudaMemcpyAsync(d_all_ntt + off * N, d_cp, N * sizeof(int32_t), cudaMemcpyDeviceToDevice, st);
-  off++;
-  for (int i = 0; i < K; i++) {
-    cudaMemcpyAsync(d_all_ntt + off * N, d_t1 + i * N, N * sizeof(int32_t), cudaMemcpyDeviceToDevice, st);
-    off++;
-  }
+  /* Pack z, cp, t1 into one contiguous buffer for batched NTT */
+  cudaMemcpyAsync(d_ntt,
+                  d_z,  L * N * sizeof(int32_t),
+                  cudaMemcpyDeviceToDevice, g_stream);
+  cudaMemcpyAsync(d_ntt + L * N,
+                  d_cp, N * sizeof(int32_t),
+                  cudaMemcpyDeviceToDevice, g_stream);
+  cudaMemcpyAsync(d_ntt + (L + 1) * N,
+                  d_t1, K * N * sizeof(int32_t),
+                  cudaMemcpyDeviceToDevice, g_stream);
 
+  /* ---- Kernel section (timed separately) -------------------------- */
 #ifdef GPU_VERIFY_BENCHMARK
-  cudaEvent_t evt_start, evt_stop;
-  cudaEventCreate(&evt_start);
-  cudaEventCreate(&evt_stop);
-  cudaEventRecord(evt_start, st);
+  cudaEventRecord(kern_start, g_stream);
 #endif
 
-  kernel_ntt<<<n_ntt, 128, 0, st>>>(d_all_ntt, n_ntt);
-  CUDA_CHECK(cudaGetLastError());
+  /* Batched NTT: all L+1+K polynomials in one launch */
+  kernel_ntt<<<n_ntt, 128, 0, g_stream>>>(d_ntt, n_ntt);
 
-  off = 0;
-  for (int j = 0; j < L; j++) {
-    cudaMemcpyAsync(d_z + j * N, d_all_ntt + off * N, N * sizeof(int32_t), cudaMemcpyDeviceToDevice, st);
-    off++;
-  }
-  cudaMemcpyAsync(d_cp, d_all_ntt + off * N, N * sizeof(int32_t), cudaMemcpyDeviceToDevice, st);
-  off++;
-  for (int i = 0; i < K; i++) {
-    cudaMemcpyAsync(d_t1 + i * N, d_all_ntt + off * N, N * sizeof(int32_t), cudaMemcpyDeviceToDevice, st);
-    off++;
-  }
+  /* Unpack back */
+  cudaMemcpyAsync(d_z,  d_ntt,
+                  L * N * sizeof(int32_t),
+                  cudaMemcpyDeviceToDevice, g_stream);
+  cudaMemcpyAsync(d_cp, d_ntt + L * N,
+                  N * sizeof(int32_t),
+                  cudaMemcpyDeviceToDevice, g_stream);
+  cudaMemcpyAsync(d_t1, d_ntt + (L + 1) * N,
+                  K * N * sizeof(int32_t),
+                  cudaMemcpyDeviceToDevice, g_stream);
 
-  /* mat stays in standard form; z, cp, t1 now in NTT (matches ref). */
-  kernel_w1_from_az_ct<<<K, N, 0, st>>>(d_mat, d_z, d_cp, d_t1, d_w1);
-  CUDA_CHECK(cudaGetLastError());
+  /* Pointwise: w1 = Az - ct */
+  kernel_w1_from_az_ct<<<K, N, 0, g_stream>>>(d_mat, d_z, d_cp, d_t1, d_w1);
+  kernel_reduce<<<K, N, 0, g_stream>>>(d_w1);
 
-  kernel_reduce<<<K, N, 0, st>>>(d_w1);
-
-  kernel_invntt<<<K, 128, 0, st>>>(d_w1, K);
-  CUDA_CHECK(cudaGetLastError());
+  /* Inverse NTT */
+  kernel_invntt<<<K, 128, 0, g_stream>>>(d_w1, K);
 
 #ifdef GPU_VERIFY_BENCHMARK
-  cudaEventRecord(evt_stop, st);
-  cudaEventSynchronize(evt_stop);
-  float kernel_ms = 0.0f;
-  cudaEventElapsedTime(&kernel_ms, evt_start, evt_stop);
-  cudaEventDestroy(evt_start);
-  cudaEventDestroy(evt_stop);
-  gpu_benchmark_total_ms += (double)kernel_ms;
-  gpu_benchmark_n_calls++;
+  cudaEventRecord(kern_stop, g_stream);
 #endif
 
-  device_to_host_w1(d_w1, w1, st);
-  CUDA_CHECK(cudaStreamSynchronize(st));
+  /* ---- Download result ------------------------------------------- */
+  cudaMemcpyAsync(w1->vec[0].coeffs, d_w1,
+                  K * N * sizeof(int32_t),
+                  cudaMemcpyDeviceToHost, g_stream);
 
-  cudaFree(d_all_ntt);
-  cudaFree(d_w1);
-  cudaFree(d_t1);
-  cudaFree(d_cp);
-  cudaFree(d_z);
-  cudaFree(d_mat);
-  cudaStreamDestroy(st);
+  cudaStreamSynchronize(g_stream);
+
+  /* ---- Accumulate timings ---------------------------------------- */
+#ifdef GPU_VERIFY_BENCHMARK
+  cudaEventRecord(e2e_stop, g_stream);
+  cudaEventSynchronize(e2e_stop);
+
+  float km = 0, em = 0;
+  cudaEventElapsedTime(&km, kern_start, kern_stop);
+  cudaEventElapsedTime(&em, e2e_start,  e2e_stop);
+
+  gpu_kernel_total_ms += km;
+  gpu_e2e_total_ms    += em;
+  gpu_n_calls++;
+
+  cudaEventDestroy(kern_start); cudaEventDestroy(kern_stop);
+  cudaEventDestroy(e2e_start);  cudaEventDestroy(e2e_stop);
+#endif
+
   return 0;
+}
+
+/*
+ * gpu_warmup()
+ * Call ONCE before benchmarking. Eliminates:
+ *   - CUDA context initialisation (~100ms first call)
+ *   - JIT compilation overhead
+ *   - Cache cold-start effects
+ * Pass dummy (real) inputs so the kernel actually executes.
+ */
+void gpu_warmup(polyveck *w1, const polyvecl mat[K], const polyvecl *z,
+                const poly *cp, const polyveck *t1) {
+  if (gpu_init() != 0) return;
+  /* Run 20 warmup calls, ignore results */
+  for (int i = 0; i < 20; i++)
+    gpu_compute_wprime(w1, mat, z, cp, t1);
+  cudaDeviceSynchronize();
+  /* Reset benchmark counters so warmup doesn't pollute results */
+#ifdef GPU_VERIFY_BENCHMARK
+  gpu_kernel_total_ms = 0.0;
+  gpu_e2e_total_ms    = 0.0;
+  gpu_n_calls         = 0;
 #endif
+  fprintf(stderr, "[GPU] Warmup complete (20 calls).\n");
+}
+
+/*
+ * gpu_cleanup()
+ * Free persistent GPU resources. Call at program exit if desired.
+ * (atexit handles benchmark printing separately.)
+ */
+void gpu_cleanup(void) {
+  if (!g_initialized) return;
+  cudaStreamSynchronize(g_stream);
+  cudaFree(d_mat); cudaFree(d_z); cudaFree(d_cp);
+  cudaFree(d_t1);  cudaFree(d_w1); cudaFree(d_ntt);
+  cudaStreamDestroy(g_stream);
+  d_mat = d_z = d_cp = d_t1 = d_w1 = d_ntt = NULL;
+  g_initialized = 0;
 }
 
 } /* extern "C" */
