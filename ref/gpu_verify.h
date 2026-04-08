@@ -2,27 +2,38 @@
 #define GPU_VERIFY_H
 
 #include "params.h"
-#include "poly.h"
 #include "polyvec.h"
+#include "poly.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
- * Compute w' = A·z − c·t (polynomial domain) on GPU.
- * Performs NTT -> pointwise mult -> invNTT for the verification bottleneck.
- * Uses ref types: mat (K×L), z (L), cp (1), t1 (K); writes result into w1 (K).
- * t1 is used as 2^D·t1 (shiftl applied inside).
- *
- * Returns 0 on success, -1 if GPU path unavailable or error.
- * On -1, caller should fall back to CPU verification.
+ * Compute w1 = A*z - c*t1 on GPU (NTT domain).
+ * GPU buffers are allocated once on first call and reused.
+ * Returns 0 on success, -1 on error.
  */
 int gpu_compute_wprime(polyveck *w1,
                        const polyvecl mat[K],
                        const polyvecl *z,
                        const poly *cp,
                        const polyveck *t1);
+
+/**
+ * Run 20 warmup iterations before benchmarking.
+ * Also resets benchmark counters so warmup is excluded from results.
+ */
+void gpu_warmup(polyveck *w1,
+                const polyvecl mat[K],
+                const polyvecl *z,
+                const poly *cp,
+                const polyveck *t1);
+
+/**
+ * Free persistent GPU allocations. Optional — OS will reclaim anyway.
+ */
+void gpu_cleanup(void);
 
 #ifdef __cplusplus
 }
